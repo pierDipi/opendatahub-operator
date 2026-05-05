@@ -384,7 +384,10 @@ func handleCleanup(t *testing.T) {
 }
 
 // testDeadlineMargin is the safety margin subtracted from the go test -timeout deadline.
-const testDeadlineMargin = 5 * time.Minute
+// 10 minutes gives enough room for long-running operations (monitoring stack,
+// resilience tests) to complete their cleanup and produce JUnit output before
+// the Go test deadline kills the process.
+const testDeadlineMargin = 10 * time.Minute
 
 // TestOdhOperator sets up the testing suite for the Operator.
 func TestOdhOperator(t *testing.T) {
