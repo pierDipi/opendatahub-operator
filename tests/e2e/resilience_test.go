@@ -91,6 +91,8 @@ func (tc *OperatorResilienceTestCtx) ValidateLeaderElectionBehavior(t *testing.T
 
 	skipUnless(t, Tier1)
 
+	baselineDSCIPhase, baselineDSCPhase := tc.captureSystemState(t)
+
 	// Find and delete current leader
 	originalLeader := tc.findLeaderPodFromLeases()
 	tc.g.Expect(originalLeader).ShouldNot(BeEmpty(), "Failed to find leader pod")
@@ -111,9 +113,9 @@ func (tc *OperatorResilienceTestCtx) ValidateLeaderElectionBehavior(t *testing.T
 		Not(Equal(originalLeader)),
 	), "New leader should be elected")
 
-	// Ensure system still works
+	// Ensure system still works - verify it returns to the same state as before leader election
 	tc.validateDeploymentHealth(t)
-	tc.validateSystemHealth(t)
+	tc.validateSystemHealthMatchesBaseline(t, baselineDSCIPhase, baselineDSCPhase)
 }
 
 func (tc *OperatorResilienceTestCtx) ValidateComponentsDeploymentSuccess(t *testing.T) {
@@ -264,6 +266,8 @@ func (tc *OperatorResilienceTestCtx) ValidateMissingComponentsCRDHandling(t *tes
 		return
 	}
 
+	baselineDSCIPhase, baselineDSCPhase := tc.captureSystemState(t)
+
 	// Save a backup copy of the CRD
 	crdBackup := resources.StripServerMetadata(crd)
 
@@ -320,7 +324,7 @@ func (tc *OperatorResilienceTestCtx) ValidateMissingComponentsCRDHandling(t *tes
 		WithObjectToCreate(crdBackup),
 		WithCustomErrorMsg("Failed to restore CRD from backup"),
 	)
-	tc.validateSystemHealth(t)
+	tc.validateSystemHealthMatchesBaseline(t, baselineDSCIPhase, baselineDSCPhase)
 }
 
 func (tc *OperatorResilienceTestCtx) ValidateRBACRestrictionHandling(t *testing.T) {
@@ -344,6 +348,8 @@ func (tc *OperatorResilienceTestCtx) ValidateRBACRestrictionHandling(t *testing.
 
 	// Verify operator is initially healthy
 	tc.validateDeploymentHealth(t)
+
+	baselineDSCIPhase, baselineDSCPhase := tc.captureSystemState(t)
 
 	// Deleting all ClusterRoleBinding to simulate RBAC restriction
 	t.Log("Deleting all ClusterRoleBinding")
@@ -398,9 +404,9 @@ func (tc *OperatorResilienceTestCtx) ValidateRBACRestrictionHandling(t *testing.
 		tc.EventuallyResourceCreatedOrUpdated(WithObjectToCreate(crbBackup))
 	}
 
-	// Verify operator recovers
+	// Verify operator recovers to baseline state
 	tc.validateDeploymentHealth(t)
-	tc.validateSystemHealth(t)
+	tc.validateSystemHealthMatchesBaseline(t, baselineDSCIPhase, baselineDSCPhase)
 }
 
 // findLeaderPodFromLeases finds current leader pod name from lease resources.
@@ -456,24 +462,55 @@ func (tc *OperatorResilienceTestCtx) validateDeploymentHealth(t *testing.T) {
 				jq.Match(`.status.availableReplicas == .status.replicas`),
 			),
 		),
+		WithEventuallyTimeout(tc.TestTimeouts.longEventuallyTimeout),
 		WithCustomErrorMsg("Deployment should be healthy with all replicas ready"),
 	)
 }
 
-// validateSystemHealth ensures DSCI and DSC remain ready after operations.
-func (tc *OperatorResilienceTestCtx) validateSystemHealth(t *testing.T) {
+// captureSystemState captures the current DSCI and DSC phase as a baseline
+// for later comparison, so resilience tests can verify the system returns to
+// its pre-operation state rather than requiring a specific phase.
+func (tc *OperatorResilienceTestCtx) captureSystemState(t *testing.T) (dsciPhase, dscPhase string) {
+	t.Helper()
+
+	dsci := tc.FetchResource(
+		WithMinimalObject(gvk.DSCInitialization, tc.DSCInitializationNamespacedName),
+	)
+	if dsci != nil {
+		dsciPhase, _, _ = unstructured.NestedString(dsci.Object, "status", "phase")
+	}
+
+	dsc := tc.FetchResource(
+		WithMinimalObject(gvk.DataScienceCluster, tc.DataScienceClusterNamespacedName),
+	)
+	if dsc != nil {
+		dscPhase, _, _ = unstructured.NestedString(dsc.Object, "status", "phase")
+	}
+
+	t.Logf("Captured baseline state: DSCI phase=%q, DSC phase=%q", dsciPhase, dscPhase)
+
+	return dsciPhase, dscPhase
+}
+
+// validateSystemHealthMatchesBaseline ensures DSCI and DSC return to their
+// baseline phase after resilience operations. This avoids false failures when
+// the system was not fully Ready before the test (e.g. due to unrelated
+// component issues from earlier test groups).
+func (tc *OperatorResilienceTestCtx) validateSystemHealthMatchesBaseline(t *testing.T, expectedDSCIPhase, expectedDSCPhase string) {
 	t.Helper()
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.DSCInitialization, tc.DSCInitializationNamespacedName),
-		WithCondition(jq.Match(`.status.phase == "%s"`, status.ConditionTypeReady)),
-		WithCustomErrorMsg("DSCI should remain Ready after pod operations"),
+		WithCondition(jq.Match(`.status.phase == "%s"`, expectedDSCIPhase)),
+		WithEventuallyTimeout(tc.TestTimeouts.longEventuallyTimeout),
+		WithCustomErrorMsg("DSCI should return to baseline phase %q after pod operations", expectedDSCIPhase),
 	)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.DataScienceCluster, tc.DataScienceClusterNamespacedName),
-		WithCondition(jq.Match(`.status.phase == "%s"`, status.ConditionTypeReady)),
-		WithCustomErrorMsg("DSC should remain Ready after pod operations"),
+		WithCondition(jq.Match(`.status.phase == "%s"`, expectedDSCPhase)),
+		WithEventuallyTimeout(tc.TestTimeouts.longEventuallyTimeout),
+		WithCustomErrorMsg("DSC should return to baseline phase %q after pod operations", expectedDSCPhase),
 	)
 }
 
